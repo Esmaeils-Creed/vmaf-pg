@@ -51,7 +51,7 @@ jobs:
           echo "key=ffbuild-${{ env.TARGET }}-${{ env.VARIANT }}-${{ env.ADDIN }}-${SCRIPTS_HASH}" >> $GITHUB_OUTPUT
 
       - name: Restore BuildKit Cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .cache
           key: ${{ steps.cache-key.outputs.key }}
@@ -67,7 +67,7 @@ jobs:
       - name: Save BuildKit Cache
         # Only save on success to avoid poisoning the cache with broken builds
         if: success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .cache
           key: ${{ steps.cache-key.outputs.key }}
