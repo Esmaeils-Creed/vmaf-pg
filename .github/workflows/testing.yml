@@ -2,10 +2,6 @@ name: FFmpeg VMAF + CUDA (NVENC/NVDEC) Build
 
 on:
   push:
-    paths:
-      - 'scripts.d/45-vmaf.sh'
-      - 'scripts.d/50-ffnvcodec.sh'
-      - '.github/workflows/ffmpeg-build.yml'
   workflow_dispatch: {}
 
 concurrency:
@@ -16,16 +12,13 @@ env:
   DOCKER_BUILDKIT: 1
   TARGET: linux64
   VARIANT: gpl
-  ADDIN: "9.0" # Adjust to your specific addin/version pin if needed
+  ADDIN: "9.0" # Change this if you need a different FFmpeg version (e.g., "7.1", "8.1")
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Free Disk Space
+      - name: Free Disk Space (Ubuntu)
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
           docker system prune -af --volumes
@@ -37,28 +30,37 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # FIX 1: Explicitly clone the build environment so it works in ANY repository
+      - name: Clone BtbN/FFmpeg-Builds
+        run: |
+          git clone https://github.com/BtbN/FFmpeg-Builds.git build-env
+          cd build-env
+          # Optional: Pin to a specific commit for reproducibility
+          # git checkout <commit-hash>
+
       - name: Patch vars.sh for QUICKBUILD
         run: |
-          # Force QUICKBUILD=1 to pull base images from BtbN's public GHCR registry
-          sed -i 's|REPO="${GITHUB_REPOSITORY:-btbn/ffmpeg-builds}"|REPO="btbn/ffmpeg-builds"|g' util/vars.sh
+          # Force REPO to BtbN's public registry so it pulls pre-built base images
+          sed -i 's|REPO="${GITHUB_REPOSITORY:-btbn/ffmpeg-builds}"|REPO="btbn/ffmpeg-builds"|g' build-env/util/vars.sh
 
       # ADVANCED CACHING: Hash the actual build scripts. 
-      # This ensures a 95%+ cache hit rate, but automatically invalidates if you change a dependency.
       - name: Generate Cache Key
         id: cache-key
         run: |
+          cd build-env
           SCRIPTS_HASH=$(find scripts.d variants addins -type f 2>/dev/null | sort | xargs cat | sha256sum | awk '{print $1}')
           echo "key=ffbuild-${{ env.TARGET }}-${{ env.VARIANT }}-${{ env.ADDIN }}-${SCRIPTS_HASH}" >> $GITHUB_OUTPUT
 
       - name: Restore BuildKit Cache
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@v4
         with:
-          path: .cache
+          path: build-env/.cache
           key: ${{ steps.cache-key.outputs.key }}
           restore-keys: |
             ffbuild-${{ env.TARGET }}-${{ env.VARIANT }}-${{ env.ADDIN }}-
 
       - name: Build Image + FFmpeg
+        working-directory: build-env
         run: |
           # QUICKBUILD=1 skips building the base OS images, saving ~15-20 minutes.
           QUICKBUILD=1 ./makeimage.sh $TARGET $VARIANT $ADDIN
@@ -67,17 +69,30 @@ jobs:
       - name: Save BuildKit Cache
         # Only save on success to avoid poisoning the cache with broken builds
         if: success()
-        uses: actions/cache/save@v6
+        uses: actions/cache/save@v4
         with:
-          path: .cache
+          path: build-env/.cache
           key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Move Artifacts to Root
+        run: |
+          # build.sh creates artifacts in build-env/artifacts
+          # Move them to root for easy upload
+          mkdir -p artifacts
+          mv build-env/artifacts/* artifacts/ || true
 
       - name: Verify Features & Run Official Netflix VMAF Test
         run: |
-          # 1. Extract the built artifact
-          tar -xf artifacts/ffmpeg-*.tar.xz -C /tmp/
+          # 1. Extract the built artifact safely
+          TARBALL=$(ls artifacts/ffmpeg-*.tar.xz 2>/dev/null | head -n 1)
+          if [[ -z "$TARBALL" ]]; then
+            echo "❌ FAILURE: No ffmpeg tarball found in artifacts/"
+            ls -la artifacts/
+            exit 1
+          fi
+          tar -xf "$TARBALL" -C /tmp/
           
-          # 2. FIX: Dynamically find the extracted directory (it's versioned, e.g., ffmpeg-7.0-linux64-gpl)
+          # 2. Dynamically find the extracted directory (it's versioned, e.g., ffmpeg-7.0-linux64-gpl)
           EXTRACTED_DIR=$(find /tmp -maxdepth 1 -type d -name "ffmpeg-*" | head -n 1)
           if [[ -z "$EXTRACTED_DIR" ]]; then
             echo "❌ FAILURE: Could not find extracted ffmpeg directory in /tmp"
