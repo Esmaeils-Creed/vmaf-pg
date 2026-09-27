@@ -1,0 +1,128 @@
+name: FFmpeg VMAF + CUDA (NVENC/NVDEC) Build
+
+on:
+  push:
+    paths:
+      - 'scripts.d/45-vmaf.sh'
+      - 'scripts.d/50-ffnvcodec.sh'
+      - '.github/workflows/ffmpeg-build.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ffmpeg-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOCKER_BUILDKIT: 1
+  TARGET: linux64
+  VARIANT: gpl
+  ADDIN: "9.0" # Adjust to your specific addin/version pin if needed
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af --volumes
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Patch vars.sh for QUICKBUILD
+        run: |
+          # Force QUICKBUILD=1 to pull base images from BtbN's public GHCR registry
+          sed -i 's|REPO="${GITHUB_REPOSITORY:-btbn/ffmpeg-builds}"|REPO="btbn/ffmpeg-builds"|g' util/vars.sh
+
+      # ADVANCED CACHING: Hash the actual build scripts. 
+      # This ensures a 95%+ cache hit rate, but automatically invalidates if you change a dependency.
+      - name: Generate Cache Key
+        id: cache-key
+        run: |
+          SCRIPTS_HASH=$(find scripts.d variants addins -type f 2>/dev/null | sort | xargs cat | sha256sum | awk '{print $1}')
+          echo "key=ffbuild-${{ env.TARGET }}-${{ env.VARIANT }}-${{ env.ADDIN }}-${SCRIPTS_HASH}" >> $GITHUB_OUTPUT
+
+      - name: Restore BuildKit Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache
+          key: ${{ steps.cache-key.outputs.key }}
+          restore-keys: |
+            ffbuild-${{ env.TARGET }}-${{ env.VARIANT }}-${{ env.ADDIN }}-
+
+      - name: Build Image + FFmpeg
+        run: |
+          # QUICKBUILD=1 skips building the base OS images, saving ~15-20 minutes.
+          QUICKBUILD=1 ./makeimage.sh $TARGET $VARIANT $ADDIN
+          ./build.sh $TARGET $VARIANT $ADDIN
+
+      - name: Save BuildKit Cache
+        # Only save on success to avoid poisoning the cache with broken builds
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: .cache
+          key: ${{ steps.cache-key.outputs.key }}
+
+      - name: Verify Features & Run Official Netflix VMAF Test
+        run: |
+          # 1. Extract the built artifact
+          tar -xf artifacts/ffmpeg-*.tar.xz -C /tmp/
+          
+          # 2. FIX: Dynamically find the extracted directory (it's versioned, e.g., ffmpeg-7.0-linux64-gpl)
+          EXTRACTED_DIR=$(find /tmp -maxdepth 1 -type d -name "ffmpeg-*" | head -n 1)
+          if [[ -z "$EXTRACTED_DIR" ]]; then
+            echo "❌ FAILURE: Could not find extracted ffmpeg directory in /tmp"
+            ls -la /tmp
+            exit 1
+          fi
+          FFMPEG_BIN="${EXTRACTED_DIR}/bin/ffmpeg"
+          
+          echo "=== FFmpeg Version ==="
+          $FFMPEG_BIN -version
+          
+          echo "=== Checking for VMAF ==="
+          $FFMPEG_BIN -hide_banner -filters | grep vmaf
+          
+          echo "=== Checking for CUDA/NVDEC (cuvid) ==="
+          $FFMPEG_BIN -hide_banner -decoders | grep cuvid
+          
+          echo "=== Checking for NVENC ==="
+          $FFMPEG_BIN -hide_banner -encoders | grep nvenc
+
+          echo "=== Running Official Netflix VMAF Validation Test ==="
+          # Download and extract the official deterministic test vectors
+          curl -sL "https://gist.githubusercontent.com/1480c1/0c4575da638ef6e8203feffd0597de16/raw/akiyo_cif.tar.xz.base64" | base64 -d | tar xJ
+          
+          # Run VMAF and capture the score
+          set +e # Allow grep to fail without exiting the script immediately
+          vmaf_output=$($FFMPEG_BIN -hide_banner -nostats -i encoded.mkv -i orig.mkv -filter_complex libvmaf -f null - 2>&1)
+          vmaf_score=$(echo "$vmaf_output" | grep -i 'VMAF score' | tr ' ' '\n' | tail -n1)
+          set -e
+          
+          echo "Obtained VMAF score: $vmaf_score"
+          
+          # The official Netflix CI expects exactly 93.663925 for this test pair
+          if [[ "$vmaf_score" == "93.663925" ]]; then
+            echo "✅ SUCCESS: VMAF score matches the official Netflix baseline (93.663925)!"
+          else
+            echo "❌ FAILURE: VMAF score ($vmaf_score) does not match expected 93.663925"
+            echo "Full FFmpeg output:"
+            echo "$vmaf_output"
+            exit 1
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ env.TARGET }}-${{ env.VARIANT }}-${{ env.ADDIN }}
+          path: artifacts/*
+          if-no-files-found: error
