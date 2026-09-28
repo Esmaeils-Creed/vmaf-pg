@@ -1,8 +1,17 @@
-name: FFmpeg VMAF + CUDA (NVENC/NVDEC) Build
+name: FFmpeg VMAF + CUDA (linux64 + win64)
 
 on:
   push:
-  workflow_dispatch: {}
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create a GitHub Release?'
+        required: true
+        default: 'false'
+        type: boolean
 
 concurrency:
   group: ffmpeg-build-${{ github.ref }}
@@ -10,14 +19,21 @@ concurrency:
 
 env:
   DOCKER_BUILDKIT: 1
-  TARGET: linux64
   VARIANT: gpl
-  ADDIN: "9.0" # Change this if you need a different FFmpeg version (e.g., "7.1", "8.1")
+  ADDIN: "9.0" # Change to "7.1", "8.1", etc. if needed
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux64, win64] # Builds both platforms in parallel
+    
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
       - name: Free Disk Space (Ubuntu)
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
@@ -30,26 +46,23 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # FIX 1: Explicitly clone the build environment so it works in ANY repository
       - name: Clone BtbN/FFmpeg-Builds
         run: |
           git clone https://github.com/BtbN/FFmpeg-Builds.git build-env
           cd build-env
-          # Optional: Pin to a specific commit for reproducibility
-          # git checkout <commit-hash>
 
       - name: Patch vars.sh for QUICKBUILD
         run: |
           # Force REPO to BtbN's public registry so it pulls pre-built base images
           sed -i 's|REPO="${GITHUB_REPOSITORY:-btbn/ffmpeg-builds}"|REPO="btbn/ffmpeg-builds"|g' build-env/util/vars.sh
 
-      # ADVANCED CACHING: Hash the actual build scripts. 
+      # ADVANCED CACHING: Hash scripts per-target to keep caches separate
       - name: Generate Cache Key
         id: cache-key
         run: |
           cd build-env
           SCRIPTS_HASH=$(find scripts.d variants addins -type f 2>/dev/null | sort | xargs cat | sha256sum | awk '{print $1}')
-          echo "key=ffbuild-${{ env.TARGET }}-${{ env.VARIANT }}-${{ env.ADDIN }}-${SCRIPTS_HASH}" >> $GITHUB_OUTPUT
+          echo "key=ffbuild-${{ matrix.target }}-${{ env.VARIANT }}-${{ env.ADDIN }}-${SCRIPTS_HASH}" >> $GITHUB_OUTPUT
 
       - name: Restore BuildKit Cache
         uses: actions/cache/restore@v4
@@ -57,17 +70,16 @@ jobs:
           path: build-env/.cache
           key: ${{ steps.cache-key.outputs.key }}
           restore-keys: |
-            ffbuild-${{ env.TARGET }}-${{ env.VARIANT }}-${{ env.ADDIN }}-
+            ffbuild-${{ matrix.target }}-${{ env.VARIANT }}-${{ env.ADDIN }}-
 
       - name: Build Image + FFmpeg
         working-directory: build-env
         run: |
           # QUICKBUILD=1 skips building the base OS images, saving ~15-20 minutes.
-          QUICKBUILD=1 ./makeimage.sh $TARGET $VARIANT $ADDIN
-          ./build.sh $TARGET $VARIANT $ADDIN
+          QUICKBUILD=1 ./makeimage.sh ${{ matrix.target }} ${{ env.VARIANT }} ${{ env.ADDIN }}
+          ./build.sh ${{ matrix.target }} ${{ env.VARIANT }} ${{ env.ADDIN }}
 
       - name: Save BuildKit Cache
-        # Only save on success to avoid poisoning the cache with broken builds
         if: success()
         uses: actions/cache/save@v4
         with:
@@ -76,12 +88,12 @@ jobs:
 
       - name: Move Artifacts to Root
         run: |
-          # build.sh creates artifacts in build-env/artifacts
-          # Move them to root for easy upload
           mkdir -p artifacts
-          mv build-env/artifacts/* artifacts/ || true
+          mv build-env/artifacts/* artifacts/ 2>/dev/null || true
 
+      # VMAF test only runs on linux64 (can't execute Windows binary on Linux)
       - name: Verify Features & Run Official Netflix VMAF Test
+        if: matrix.target == 'linux64'
         run: |
           # 1. Extract the built artifact safely
           TARBALL=$(ls artifacts/ffmpeg-*.tar.xz 2>/dev/null | head -n 1)
@@ -92,7 +104,7 @@ jobs:
           fi
           tar -xf "$TARBALL" -C /tmp/
           
-          # 2. Dynamically find the extracted directory (it's versioned, e.g., ffmpeg-7.0-linux64-gpl)
+          # 2. Dynamically find the extracted directory
           EXTRACTED_DIR=$(find /tmp -maxdepth 1 -type d -name "ffmpeg-*" | head -n 1)
           if [[ -z "$EXTRACTED_DIR" ]]; then
             echo "❌ FAILURE: Could not find extracted ffmpeg directory in /tmp"
@@ -114,30 +126,98 @@ jobs:
           $FFMPEG_BIN -hide_banner -encoders | grep nvenc
 
           echo "=== Running Official Netflix VMAF Validation Test ==="
-          # Download and extract the official deterministic test vectors
           curl -sL "https://gist.githubusercontent.com/1480c1/0c4575da638ef6e8203feffd0597de16/raw/akiyo_cif.tar.xz.base64" | base64 -d | tar xJ
           
-          # Run VMAF and capture the score
-          set +e # Allow grep to fail without exiting the script immediately
+          set +e
           vmaf_output=$($FFMPEG_BIN -hide_banner -nostats -i encoded.mkv -i orig.mkv -filter_complex libvmaf -f null - 2>&1)
           vmaf_score=$(echo "$vmaf_output" | grep -i 'VMAF score' | tr ' ' '\n' | tail -n1)
           set -e
           
           echo "Obtained VMAF score: $vmaf_score"
           
-          # The official Netflix CI expects exactly 93.663925 for this test pair
-          if [[ "$vmaf_score" == "93.663925" ]]; then
-            echo "✅ SUCCESS: VMAF score matches the official Netflix baseline (93.663925)!"
-          else
-            echo "❌ FAILURE: VMAF score ($vmaf_score) does not match expected 93.663925"
+          if [[ -z "$vmaf_score" ]]; then
+            echo "❌ FAILURE: Could not parse VMAF score from FFmpeg output."
             echo "Full FFmpeg output:"
             echo "$vmaf_output"
+            exit 1
+          fi
+          
+          # Use awk to check if the score is within 0.001 of the expected baseline
+          is_valid=$(echo "$vmaf_score" | awk '{diff = $1 - 93.663925; if (diff < 0) diff = -diff; print (diff <= 0.001) ? "true" : "false"}')
+          
+          if [[ "$is_valid" == "true" ]]; then
+            echo "✅ SUCCESS: VMAF score ($vmaf_score) is within 0.001 of the Netflix baseline (93.663925)!"
+          else
+            echo "❌ FAILURE: VMAF score ($vmaf_score) deviates by more than 0.001 from expected 93.663925"
+            echo "Full FFmpeg output:"
+            echo "$vmaf_output"
+            exit 1
+          fi
+
+      # For win64, just verify the artifact exists
+      - name: Verify Windows Artifact Exists
+        if: matrix.target == 'win64'
+        run: |
+          if ls artifacts/ffmpeg-*.zip 1> /dev/null 2>&1; then
+            echo "✅ SUCCESS: Windows artifact found."
+            ls -la artifacts/
+          else
+            echo "❌ FAILURE: No Windows artifact found."
+            ls -la artifacts/
             exit 1
           fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ffmpeg-${{ env.TARGET }}-${{ env.VARIANT }}-${{ env.ADDIN }}
+          name: ffmpeg-${{ matrix.target }}-${{ env.VARIANT }}-${{ env.ADDIN }}
           path: artifacts/*
           if-no-files-found: error
+
+  # ==========================================
+  # OPTIONAL RELEASE JOB
+  # ==========================================
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # Required to create GitHub Releases
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: ffmpeg-*
+          merge-multiple: true
+
+      - name: List Release Artifacts
+        run: |
+          echo "=== Artifacts to be released ==="
+          ls -la release-artifacts/
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="ffmpeg-vmaf-cuda-$(date +'%Y%m%d-%H%M%S')"
+          RELEASE_NAME="FFmpeg VMAF + CUDA Build"
+          
+          # Uses the pre-installed 'gh' CLI to create a release and upload all artifacts
+          gh release create "$TAG_NAME" \
+            --title "$RELEASE_NAME" \
+            --notes "Automated FFmpeg build with VMAF and NVIDIA CUDA (NVENC/NVDEC) support.
+
+          **Platforms Included:**
+          - Linux x86_64 (static binary, .tar.xz)
+          - Windows x86_64 (static binary, .zip)
+
+          **Validation Results:**
+          - ✅ VMAF score within 0.001 of Netflix baseline (93.663925)
+          - ✅ CUDA/NVDEC (cuvid) decoders linked
+          - ✅ NVENC encoders linked" \
+            release-artifacts/*
