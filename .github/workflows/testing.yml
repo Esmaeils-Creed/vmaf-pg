@@ -65,7 +65,7 @@ jobs:
           echo "key=ffbuild-${{ matrix.target }}-${{ env.VARIANT }}-${{ env.ADDIN }}-${SCRIPTS_HASH}" >> $GITHUB_OUTPUT
 
       - name: Restore BuildKit Cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: build-env/.cache
           key: ${{ steps.cache-key.outputs.key }}
@@ -81,7 +81,7 @@ jobs:
 
       - name: Save BuildKit Cache
         if: success()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: build-env/.cache
           key: ${{ steps.cache-key.outputs.key }}
